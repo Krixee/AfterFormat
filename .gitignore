@@ -1,0 +1,9 @@
+downloads/
+__pycache__/
+*.pyc
+error.log
+dist/
+build/
+*.spec
+AfterFormat.exe
+chromedriver.exe

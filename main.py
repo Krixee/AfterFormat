@@ -19,6 +19,8 @@ from ttkthemes import ThemedTk
 import wmi
 import pythoncom
 import webbrowser
+import ipaddress
+import ctypes
 
 if not os.path.exists("downloads"):
     os.makedirs("downloads")
@@ -147,7 +149,108 @@ def activate_windows():
         log_error(f"Windows etkinleştirme hatası: {e}")
         return False
 
-def download_file(url, filename, progress_label=None, status_label=None, popup=None):
+def validate_ip(ip, is_ipv6=False):
+    try:
+        ip_obj = ipaddress.ip_address(ip)
+        if is_ipv6 and not isinstance(ip_obj, ipaddress.IPv6Address):
+            log_error(f"Geçersiz IPv6 adresi: {ip}")
+            return False
+        if not is_ipv6 and not isinstance(ip_obj, ipaddress.IPv4Address):
+            log_error(f"Geçersiz IPv4 adresi: {ip}")
+            return False
+        return True
+    except ValueError as e:
+        log_error(f"IP doğrulama hatası: {ip} - {e}")
+        return False
+
+def change_dns():
+    ipv4_primary = "1.1.1.1"
+    ipv4_secondary = "1.0.0.1"
+    ipv6_primary = "2606:4700:4700::1111"
+    ipv6_secondary = "2606:4700:4700::1001"
+    try:
+        subprocess.run(
+            ["ipconfig", "/flushdns"],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        log_error("DNS önbelleği temizlendi.")
+
+        result = subprocess.run(
+            ["powershell", "-Command", "Get-NetAdapter | Where-Object {$_.Status -eq 'Up'} | Select-Object -ExpandProperty Name"],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        adapters = result.stdout.strip().split("\n")
+        if not adapters or adapters == [""]:
+            log_error("Hiçbir aktif ağ adaptörü bulunamadı.")
+            return False
+
+        success = True
+        for adapter in adapters:
+            adapter = adapter.strip()
+            if not adapter:
+                continue
+
+            try:
+                if validate_ip(ipv4_primary, is_ipv6=False):
+                    subprocess.run(
+                        ["powershell", "-Command", f"Set-DnsClientServerAddress -InterfaceAlias '{adapter}' -ServerAddresses ('{ipv4_primary}')"],
+                        capture_output=True,
+                        text=True,
+                        check=True
+                    )
+                    log_error(f"{adapter} için IPv4 birincil DNS {ipv4_primary} olarak ayarlandı.")
+                if validate_ip(ipv4_secondary, is_ipv6=False):
+                    subprocess.run(
+                        ["powershell", "-Command", f"Set-DnsClientServerAddress -InterfaceAlias '{adapter}' -ServerAddresses ('{ipv4_primary}', '{ipv4_secondary}')"],
+                        capture_output=True,
+                        text=True,
+                        check=True
+                    )
+                    log_error(f"{adapter} için IPv4 ikincil DNS {ipv4_secondary} olarak ayarlandı.")
+
+                if validate_ip(ipv6_primary, is_ipv6=True):
+                    subprocess.run(
+                        ["powershell", "-Command", f"Set-DnsClientServerAddress -InterfaceAlias '{adapter}' -ServerAddresses ('{ipv6_primary}')"],
+                        capture_output=True,
+                        text=True,
+                        check=True
+                    )
+                    log_error(f"{adapter} için IPv6 birincil DNS {ipv6_primary} olarak ayarlandı.")
+                if validate_ip(ipv6_secondary, is_ipv6=True):
+                    subprocess.run(
+                        ["powershell", "-Command", f"Set-DnsClientServerAddress -InterfaceAlias '{adapter}' -ServerAddresses ('{ipv6_primary}', '{ipv6_secondary}')"],
+                        capture_output=True,
+                        text=True,
+                        check=True
+                    )
+                    log_error(f"{adapter} için IPv6 ikincil DNS {ipv6_secondary} olarak ayarlandı.")
+            except subprocess.CalledProcessError as e:
+                log_error(f"DNS değiştirme hatası ({adapter}): {e.stderr}")
+                success = False
+            except Exception as e:
+                log_error(f"DNS değiştirme hatası ({adapter}): {e}")
+                success = False
+
+        subprocess.run(
+            ["ipconfig", "/flushdns"],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        log_error("DNS önbelleği tekrar temizlendi.")
+        return success
+    except subprocess.CalledProcessError as e:
+        log_error(f"Ağ adaptörlerini listeleme hatası: {e.stderr}")
+        return False
+    except Exception as e:
+        log_error(f"DNS değiştirme hatası: {e}")
+        return False
+
+def download_file(url, filename, progress_label=None):
     try:
         response = requests.get(url, stream=True)
         total_size = int(response.headers.get('content-length', 0))
@@ -168,55 +271,42 @@ def download_file(url, filename, progress_label=None, status_label=None, popup=N
                 bar.update(len(chunk))
                 if progress_label and total_size > 0:
                     downloaded_mb = downloaded / (1024 * 1024)
-                    status_label.config(text=f"↻ {downloaded_mb:.2f}/{total_size_mb:.2f} MB {filename}")
-                    popup.update()
+                    progress_label.config(text=f"↻ {downloaded_mb:.2f}/{total_size_mb:.2f} MB {filename}")
+                    progress_label.update()
         log_error(f"{filename} indirildi!")
         if progress_label:
             progress_label.config(text=f"Tamamlandı: {filename}")
-        if status_label and popup:
-            status_label.config(text=f"✓ {downloaded_mb:.2f}/{total_size_mb:.2f} MB {filename}")
-            popup.update()
+            progress_label.update()
         return filepath
     except Exception as e:
         log_error(f"Hata (download_file): {url} - {e}")
         if progress_label:
             progress_label.config(text=f"Hata: {filename} indirilemedi")
-        if status_label and popup:
-            status_label.config(text=f"✗ 0.00/{total_size_mb:.2f} MB {filename}")
-            popup.update()
+            progress_label.update()
         return None
 
-def start_download(root, selected_programs, motherboard_var, gpu_var, clean_var, activate_var, progress_label):
+def is_admin():
+    try:
+        return ctypes.windll.shell32.IsUserAnAdmin()
+    except:
+        return False
+
+def start_download(root, selected_programs, motherboard_var, gpu_var, clean_var, activate_var, dns_var, progress_label):
     selected_items = [(program, var) for program, var in selected_programs if var.get()]
-    if not selected_items and not (motherboard_var.get() or gpu_var.get() or clean_var.get() or activate_var.get()):
+    if not selected_items and not (motherboard_var.get() or gpu_var.get() or clean_var.get() or activate_var.get() or dns_var.get()):
         progress_label.config(text="Hiçbir program veya seçenek seçilmedi.")
         return
 
-    popup = tk.Toplevel(root)
-    popup.title("İndirme ve İşlem Durumu")
-    popup.geometry("400x400")
-    popup.configure(bg="#2e2e2e")
-
-    status_labels = []
-    for item, _ in selected_items:
-        frame = ttk.Frame(popup)
-        frame.pack(fill="x", padx=10, pady=5)
-        status_label = ttk.Label(frame, text=f"↻ 0.00/0.00 MB {item['name']}", background="#2e2e2e", foreground="#ffffff")
-        status_label.pack(anchor="w")
-        status_labels.append(status_label)
-
-    progress_label_popup = ttk.Label(popup, text="İşlemler başlatılıyor...", background="#2e2e2e", foreground="#ffffff")
-    progress_label_popup.pack(pady=10)
-
     def download_thread():
-        for (item, var), status_label in zip(selected_items, status_labels):
+        failed_downloads = []
+        for item, _ in selected_items:
             name = item["name"]
             url = item["url"]
             direct_link = item["direct_link"]
 
             log_error(f"{name} için işlem başlatılıyor...")
-            progress_label_popup.config(text=f"Hazırlanıyor: {name}")
-            popup.update()
+            progress_label.config(text=f"Hazırlanıyor: {name}")
+            progress_label.update()
 
             if direct_link and check_link(direct_link):
                 download_url = direct_link
@@ -225,12 +315,14 @@ def start_download(root, selected_programs, motherboard_var, gpu_var, clean_var,
 
             if download_url:
                 filename = f"{name.replace(' ', '_')}_setup.exe"
-                download_file(download_url, filename, progress_label_popup, status_label, popup)
+                result = download_file(download_url, filename, progress_label)
+                if not result:
+                    failed_downloads.append(name)
             else:
                 log_error(f"{name} için indirme linki bulunamadı.")
-                progress_label_popup.config(text=f"Hata: {name} için link bulunamadı")
-                status_label.config(text=f"✗ 0.00/0.00 MB {name}")
-                popup.update()
+                progress_label.config(text=f"Hata: {name} için link bulunamadı")
+                progress_label.update()
+                failed_downloads.append(name)
 
         motherboard_info, gpu_info = None, None
         if motherboard_var.get() or gpu_var.get():
@@ -251,24 +343,40 @@ def start_download(root, selected_programs, motherboard_var, gpu_var, clean_var,
             clean_temp_files()
             status_message += "\nGereksiz dosyalar temizlendi."
         if activate_var.get():
-            progress_label_popup.config(text="Windows etkinleştiriliyor...")
-            popup.update()
+            progress_label.config(text="Windows etkinleştiriliyor...")
+            progress_label.update()
             if activate_windows():
                 status_message += "\nWindows etkinleştirildi."
             else:
                 status_message += "\nWindows etkinleştirme başarısız oldu."
                 messagebox.showerror("Hata", "Windows etkinleştirme başarısız oldu. Detaylar için error.log dosyasını kontrol edin.")
+        if dns_var.get():
+            progress_label.config(text="DNS ayarları değiştiriliyor...")
+            progress_label.update()
+            if change_dns():
+                status_message += "\nDNS Değiştirildi."
+            else:
+                status_message += "\nDNS değiştirme başarısız oldu."
+                messagebox.showerror("Hata", "DNS değiştirme başarısız oldu. Detaylar için error.log dosyasını kontrol edin.")
+
+        if failed_downloads:
+            status_message += "\nHata: " + ", ".join(failed_downloads) + " indirilemedi."
 
         progress_label.config(text=status_message)
-        progress_label_popup.config(text="Tüm işlemler tamamlandı!")
-        popup.update()
 
     threading.Thread(target=download_thread).start()
 
 def create_gui():
+    if not is_admin():
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showerror("Hata", "Program yönetici olarak çalıştırılmalı!")
+        root.destroy()
+        return
+
     root = ThemedTk(theme="equilux")
     root.title("AfterFormat")
-    root.geometry("400x800")
+    root.geometry("400x900")
     root.configure(bg="#2e2e2e")
 
     style = ttk.Style()
@@ -300,6 +408,7 @@ def create_gui():
     gpu_var = tk.BooleanVar()
     clean_var = tk.BooleanVar()
     activate_var = tk.BooleanVar()
+    dns_var = tk.BooleanVar()
 
     def check_motherboard():
         if motherboard_var.get():
@@ -331,10 +440,14 @@ def create_gui():
     clean_chk.pack(anchor="w", padx=30, pady=2)
     activate_chk = ttk.Checkbutton(root, text="Windows'u Etkinleştir", variable=activate_var)
     activate_chk.pack(anchor="w", padx=30, pady=2)
+    dns_chk = ttk.Checkbutton(root, text="DNS Değiştir", variable=dns_var)
+    dns_chk.pack(anchor="w", padx=30, pady=2)
+
     selected_drivers.append(("motherboard", motherboard_var))
     selected_drivers.append(("gpu", gpu_var))
     selected_drivers.append(("clean", clean_var))
     selected_drivers.append(("activate", activate_var))
+    selected_drivers.append(("dns", dns_var))
 
     all_var = tk.BooleanVar()
     all_check = ttk.Checkbutton(root, text="Tümünü Seç", variable=all_var, command=lambda: [v.set(all_var.get()) for _, v in selected_programs + selected_drivers])
@@ -343,7 +456,7 @@ def create_gui():
     progress_label = ttk.Label(root, text="Durum: Hazır")
     progress_label.pack(pady=10)
 
-    download_button = ttk.Button(root, text="İndir", command=lambda: start_download(root, selected_programs, motherboard_var, gpu_var, clean_var, activate_var, progress_label))
+    download_button = ttk.Button(root, text="İndir", command=lambda: start_download(root, selected_programs, motherboard_var, gpu_var, clean_var, activate_var, dns_var, progress_label))
     download_button.pack(pady=20)
 
     root.mainloop()
