@@ -7,3 +7,6 @@ build/
 *.spec
 AfterFormat.exe
 chromedriver.exe
+icon.ico
+THIRD_PARTY_NOTICES.chromedriver
+LICENSE.chromedriver
